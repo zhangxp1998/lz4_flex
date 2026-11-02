@@ -191,9 +191,30 @@ impl Sink for SliceSink<'_> {
     #[cfg(feature = "safe-decode")]
     #[cfg_attr(feature = "nightly", optimize(size))] // to avoid loop unrolling
     fn extend_from_within_overlapping(&mut self, start: usize, num_bytes: usize) {
+        #[cold]
+        fn copy_long_match(output: &mut [u8], offset: usize) {
+            assert!(offset != 0);
+            let mut copied = offset;
+            while copied < output.len() {
+                let len = copied.min(output.len() - copied);
+                let (src, dst) = output.split_at_mut(copied);
+                dst[..len].copy_from_slice(&src[..len]);
+                copied += len;
+            }
+        }
+
         let offset = self.pos - start;
-        for i in start + offset..start + offset + num_bytes {
-            self.output[i] = self.output[i - offset];
+        if num_bytes > 32 {
+            // Only copy bytes that have already been produced. Each copy can
+            // double the initialized repeating prefix, avoiding a serial
+            // load/store dependency for every byte of a long match.
+            copy_long_match(&mut self.output[start..self.pos + num_bytes], offset);
+        } else {
+            // The byte loop is cheaper than setting up bulk copies for the
+            // short matches handled by the decoder's hot loop.
+            for i in start + offset..start + offset + num_bytes {
+                self.output[i] = self.output[i - offset];
+            }
         }
         self.pos += num_bytes;
     }
@@ -332,6 +353,36 @@ impl Sink for PtrSink {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[cfg(feature = "safe-decode")]
+    fn overlapping_matches_preserve_pattern_and_tail() {
+        use crate::sink::{Sink, SliceSink};
+
+        for prefix_len in [0, 1, 7] {
+            for offset in [1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 255, 65535] {
+                for len in [0, 1, 17, 31, 32, 33, 34, 63, 64, 65, 127, 257, 4096, 65536] {
+                    let pos = prefix_len + offset;
+                    // Test both exact-capacity output and a dirty suffix, which
+                    // must not be read as match data or overwritten.
+                    for tail_len in [0, 11] {
+                        let mut actual = vec![0xa5; pos + len + tail_len];
+                        for (i, byte) in actual[..pos].iter_mut().enumerate() {
+                            *byte = (i.wrapping_mul(31) ^ (i >> 3)) as u8;
+                        }
+                        let mut expected = actual.clone();
+                        for i in pos..pos + len {
+                            expected[i] = expected[i - offset];
+                        }
+                        let mut sink = SliceSink::new(&mut actual, pos);
+                        sink.extend_from_within_overlapping(prefix_len, len);
+                        assert_eq!(sink.pos(), pos + len);
+                        assert_eq!(actual, expected, "offset={offset}, len={len}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     #[cfg(any(feature = "safe-encode", feature = "safe-decode"))]

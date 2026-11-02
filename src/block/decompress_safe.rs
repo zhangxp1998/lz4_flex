@@ -299,7 +299,7 @@ fn duplicate_slice(
 
 /// self-referential copy for the case data start (end of output - offset) + match_length overlaps
 /// into output
-#[inline]
+#[inline(always)] // Keep offset validation and the offset-1 fill in the decoder's fast path.
 fn duplicate_overlapping_slice(
     sink: &mut impl Sink,
     offset: usize,
