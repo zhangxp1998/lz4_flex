@@ -67,25 +67,11 @@ fn read_match_offset(input: &[u8], input_pos: &mut usize) -> Result<u16, Decompr
     }
 }
 
-const FIT_TOKEN_MASK_LITERAL: u8 = 0b00001111;
-const FIT_TOKEN_MASK_MATCH: u8 = 0b11110000;
-
-#[test]
-fn check_token() {
-    assert!(!does_token_fit(15));
-    assert!(does_token_fit(14));
-    assert!(does_token_fit(114));
-    assert!(!does_token_fit(0b11110000));
-    assert!(does_token_fit(0b10110000));
-}
-
-/// The token consists of two parts, the literal length (upper 4 bits) and match_length (lower 4
-/// bits) if the literal length and match_length are both below 15, we don't need to read additional
-/// data, so the token does fit the metadata.
+/// Returns the literal length in the upper 4 bits of the token. 15 means that more length bytes
+/// follow the token.
 #[inline]
-fn does_token_fit(token: u8) -> bool {
-    !((token & FIT_TOKEN_MASK_LITERAL) == FIT_TOKEN_MASK_LITERAL
-        || (token & FIT_TOKEN_MASK_MATCH) == FIT_TOKEN_MASK_MATCH)
+fn literal_len(token: u8) -> u8 {
+    token >> 4
 }
 
 /// Decompress all bytes of `input` into `output`.
@@ -133,23 +119,32 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
         // Ideally we want to check for safe output pos like: output.pos() <= safe_output_pos; But
         // that doesn't work when the safe_output_pos is 0 due to saturated_sub. So we use
         // `<` instead of `<=`, which covers that case.
-        if does_token_fit(token) && input_pos <= safe_input_pos && output.pos() < safe_output_pos {
-            let literal_length = (token >> 4) as usize;
+        if literal_len(token) != 15 && input_pos <= safe_input_pos && output.pos() < safe_output_pos
+        {
+            let literal_length = literal_len(token) as usize;
 
             // casting to [u8;u16] doesn't seem to make a difference vs &[u8] (same assembly)
-            let input: &[u8; 16] = input[input_pos..input_pos + 16].try_into().unwrap();
+            let literals: &[u8; 16] = input[input_pos..input_pos + 16].try_into().unwrap();
 
             // Copy the literal
             // The literal is at max 14 bytes, and the is_safe_distance check assures
             // that we are far away enough from the end so we can safely copy 16 bytes
-            output.extend_from_slice_wild(input, literal_length);
+            output.extend_from_slice_wild(literals, literal_length);
             input_pos += literal_length;
 
             // clone as we don't want to mutate
-            let offset = read_match_offset(input, &mut literal_length.clone())? as usize;
+            let offset = read_match_offset(literals, &mut literal_length.clone())? as usize;
             input_pos += 2;
 
             let mut match_length = MINMATCH + (token & 0xF) as usize;
+
+            if match_length == MINMATCH + 15 {
+                // A long match after a short literal: read the rest of its length, then copy it
+                // like the slow path does.
+                match_length += read_integer(input, &mut input_pos)?;
+                copy_match::<USE_DICT>(output, ext_dict, offset, match_length)?;
+                continue;
+            }
 
             if USE_DICT && offset > output.pos() {
                 let copied = copy_from_dict(output, ext_dict, offset, match_length)?;
@@ -225,27 +220,39 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
             match_length += read_integer(input, &mut input_pos)?;
         }
 
-        // could be skipped with unchecked-decode
-        if output.pos() + match_length > output.capacity() {
-            return Err(DecompressError::OutputTooSmall {
-                expected: output.pos() + match_length,
-                actual: output.capacity(),
-            });
-        }
-        if USE_DICT && offset > output.pos() {
-            let copied = copy_from_dict(output, ext_dict, offset, match_length)?;
-            if copied == match_length {
-                continue;
-            }
-            // match crosses ext_dict and output, offset is still correct as output_len was
-            // increased
-            match_length -= copied;
-        }
-        // We now copy from the already decompressed buffer. This allows us for storing duplicates
-        // by simply referencing the other location.
-        duplicate_slice(output, offset, match_length)?;
+        copy_match::<USE_DICT>(output, ext_dict, offset, match_length)?;
     }
     Ok(output.pos() - initial_output_pos)
+}
+
+/// Copies a match of `match_length` bytes that starts `offset` bytes back from the end of `output`.
+/// With `USE_DICT`, the match may start in `ext_dict`.
+#[inline(always)] // (always) an outlined call would keep `output` on the stack in the decoder loop
+fn copy_match<const USE_DICT: bool>(
+    output: &mut impl Sink,
+    ext_dict: &[u8],
+    offset: usize,
+    mut match_length: usize,
+) -> Result<(), DecompressError> {
+    // could be skipped with unchecked-decode
+    if output.pos() + match_length > output.capacity() {
+        return Err(DecompressError::OutputTooSmall {
+            expected: output.pos() + match_length,
+            actual: output.capacity(),
+        });
+    }
+    if USE_DICT && offset > output.pos() {
+        let copied = copy_from_dict(output, ext_dict, offset, match_length)?;
+        if copied == match_length {
+            return Ok(());
+        }
+        // match crosses ext_dict and output, offset is still correct as output_len was
+        // increased
+        match_length -= copied;
+    }
+    // We now copy from the already decompressed buffer. This allows us for storing duplicates
+    // by simply referencing the other location.
+    duplicate_slice(output, offset, match_length)
 }
 
 #[inline]
@@ -299,7 +306,7 @@ fn duplicate_slice(
 
 /// self-referential copy for the case data start (end of output - offset) + match_length overlaps
 /// into output
-#[inline]
+#[inline(always)]
 fn duplicate_overlapping_slice(
     sink: &mut impl Sink,
     offset: usize,
